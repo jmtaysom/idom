@@ -9,6 +9,7 @@ from pathlib import Path
 from string import Template
 from typing import Any, List, NewType, Optional, Set, Tuple, Union, overload
 from urllib.parse import urlparse
+from warnings import warn
 
 from idom.config import IDOM_DEBUG_MODE, IDOM_WEB_MODULES_DIR
 from idom.core.types import ImportSourceDict, VdomDictConstructor
@@ -35,7 +36,7 @@ URL_SOURCE = SourceType("URL")
 def module_from_url(
     url: str,
     fallback: Optional[Any] = None,
-    resolve_exports: bool = IDOM_DEBUG_MODE.current,
+    resolve_exports: bool | None = None,
     resolve_exports_depth: int = 5,
     unmount_before_update: bool = False,
 ) -> WebModule:
@@ -64,7 +65,11 @@ def module_from_url(
         file=None,
         export_names=(
             resolve_module_exports_from_url(url, resolve_exports_depth)
-            if resolve_exports
+            if (
+                resolve_exports
+                if resolve_exports is not None
+                else IDOM_DEBUG_MODE.current
+            )
             else None
         ),
         unmount_before_update=unmount_before_update,
@@ -79,8 +84,7 @@ def module_from_template(
     package: str,
     cdn: str = "https://esm.sh",
     fallback: Optional[Any] = None,
-    exports_default: bool = False,
-    resolve_exports: bool = IDOM_DEBUG_MODE.current,
+    resolve_exports: bool | None = None,
     resolve_exports_depth: int = 5,
     unmount_before_update: bool = False,
 ) -> WebModule:
@@ -93,7 +97,7 @@ def module_from_template(
 
         This approach is not recommended for use in a production setting because the
         framework templates may use unpinned dependencies that could change without
-        warning.cIt's best to author a module adhering to the
+        warning. It's best to author a module adhering to the
         :ref:`Custom Javascript Component` interface instead.
 
     **Templates**
@@ -110,8 +114,6 @@ def module_from_template(
             Where the package should be loaded from. The CDN must distribute ESM modules
         fallback:
             What to temporarilly display while the module is being loaded.
-        exports_default:
-            Whether the module has a default export.
         resolve_imports:
             Whether to try and find all the named exports of this module.
         resolve_exports_depth:
@@ -122,6 +124,14 @@ def module_from_template(
             Using this option has negative performance consequences since all DOM
             elements must be changed on each render. See :issue:`461` for more info.
     """
+    warn(
+        "module_from_template() is deprecated due to instability - use the Javascript "
+        "Components API instead. This function will be removed in a future release.",
+        DeprecationWarning,
+    )
+    template_name, _, template_version = template.partition("@")
+    template_version = "@" + template_version if template_version else ""
+
     # We do this since the package may be any valid URL path. Thus we may need to strip
     # object parameters or query information so we save the resulting template under the
     # correct file name.
@@ -130,17 +140,13 @@ def module_from_template(
     # downstream code assumes no trailing slash
     cdn = cdn.rstrip("/")
 
-    template_file_name = (
-        template
-        + (".default" if exports_default else "")
-        + module_name_suffix(package_name)
-    )
+    template_file_name = template_name + module_name_suffix(package_name)
 
     template_file = Path(__file__).parent / "templates" / template_file_name
     if not template_file.exists():
         raise ValueError(f"No template for {template_file_name!r} exists")
 
-    variables = {"PACKAGE": package, "CDN": cdn}
+    variables = {"PACKAGE": package, "CDN": cdn, "VERSION": template_version}
     content = Template(template_file.read_text()).substitute(variables)
 
     return module_from_string(
@@ -157,7 +163,7 @@ def module_from_file(
     name: str,
     file: Union[str, Path],
     fallback: Optional[Any] = None,
-    resolve_exports: bool = IDOM_DEBUG_MODE.current,
+    resolve_exports: bool | None = None,
     resolve_exports_depth: int = 5,
     unmount_before_update: bool = False,
     symlink: bool = False,
@@ -207,7 +213,11 @@ def module_from_file(
         file=target_file,
         export_names=(
             resolve_module_exports_from_file(source_file, resolve_exports_depth)
-            if resolve_exports
+            if (
+                resolve_exports
+                if resolve_exports is not None
+                else IDOM_DEBUG_MODE.current
+            )
             else None
         ),
         unmount_before_update=unmount_before_update,
@@ -234,7 +244,7 @@ def module_from_string(
     name: str,
     content: str,
     fallback: Optional[Any] = None,
-    resolve_exports: bool = IDOM_DEBUG_MODE.current,
+    resolve_exports: bool | None = None,
     resolve_exports_depth: int = 5,
     unmount_before_update: bool = False,
 ) -> WebModule:
@@ -278,7 +288,11 @@ def module_from_string(
         file=target_file,
         export_names=(
             resolve_module_exports_from_file(target_file, resolve_exports_depth)
-            if resolve_exports
+            if (
+                resolve_exports
+                if resolve_exports is not None
+                else IDOM_DEBUG_MODE.current
+            )
             else None
         ),
         unmount_before_update=unmount_before_update,

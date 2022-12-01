@@ -4,17 +4,18 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Tuple, Union
+from typing import Any, Awaitable, Callable, Tuple
 
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 from starlette.staticfiles import StaticFiles
-from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from idom.backend.types import Location
+from idom.backend.hooks import ConnectionContext
+from idom.backend.types import Connection, Location
 from idom.config import IDOM_WEB_MODULES_DIR
-from idom.core.hooks import Context, create_context, use_context
 from idom.core.layout import Layout, LayoutEvent
 from idom.core.serve import (
     RecvCoroutine,
@@ -24,15 +25,20 @@ from idom.core.serve import (
 )
 from idom.core.types import RootComponentConstructor
 
-from ._asgi import serve_development_asgi
-from .utils import CLIENT_BUILD_DIR, safe_client_build_dir_path
+from ._common import (
+    ASSETS_PATH,
+    CLIENT_BUILD_DIR,
+    MODULES_PATH,
+    STREAM_PATH,
+    CommonOptions,
+    read_client_index_html,
+    serve_development_asgi,
+)
+from .hooks import ConnectionContext
+from .hooks import use_connection as _use_connection
 
 
 logger = logging.getLogger(__name__)
-
-WebSocketContext: type[Context[WebSocket | None]] = create_context(
-    None, "WebSocketContext"
-)
 
 
 def configure(
@@ -40,13 +46,11 @@ def configure(
     constructor: RootComponentConstructor,
     options: Options | None = None,
 ) -> None:
-    """Return a :class:`StarletteServer` where each client has its own state.
-
-    Implements the :class:`~idom.server.proto.ServerFactory` protocol
+    """Configure the necessary IDOM routes on the given app.
 
     Parameters:
         app: An application instance
-        constructor: A component constructor
+        component: A component constructor
         options: Options for configuring server behavior
     """
     options = options or Options()
@@ -72,44 +76,30 @@ async def serve_development_app(
     await serve_development_asgi(app, host, port, started)
 
 
-def use_location() -> Location:
-    """Get the current route as a string"""
-    scope = use_scope()
-    pathname = "/" + scope["path_params"].get("path", "")
-    search = scope["query_string"].decode()
-    return Location(pathname, "?" + search if search else "")
-
-
-def use_scope() -> Scope:
-    """Get the current ASGI scope dictionary"""
-    return use_websocket().scope
-
-
 def use_websocket() -> WebSocket:
     """Get the current WebSocket object"""
-    websocket = use_context(WebSocketContext)
-    if websocket is None:
-        raise RuntimeError(  # pragma: no cover
-            "No websocket. Are you running with a Starllette server?"
+    return use_connection().carrier
+
+
+def use_connection() -> Connection[WebSocket]:
+    conn = _use_connection()
+    if not isinstance(conn.carrier, WebSocket):
+        raise TypeError(  # pragma: no cover
+            f"Connection has unexpected carrier {conn.carrier}. "
+            "Are you running with a Flask server?"
         )
-    return websocket
+    return conn
 
 
 @dataclass
-class Options:
-    """Optionsuration options for :class:`StarletteRenderServer`"""
+class Options(CommonOptions):
+    """Render server config for :func:`idom.backend.starlette.configure`"""
 
-    cors: Union[bool, Dict[str, Any]] = False
+    cors: bool | dict[str, Any] = False
     """Enable or configure Cross Origin Resource Sharing (CORS)
 
     For more information see docs for ``starlette.middleware.cors.CORSMiddleware``
     """
-
-    serve_static_files: bool = True
-    """Whether or not to serve static files (i.e. web modules)"""
-
-    url_prefix: str = ""
-    """The URL prefix where IDOM resources will be served from"""
 
 
 def _setup_common_routes(options: Options, app: Starlette) -> None:
@@ -124,43 +114,54 @@ def _setup_common_routes(options: Options, app: Starlette) -> None:
     # BUG: https://github.com/tiangolo/fastapi/issues/1469
     url_prefix = options.url_prefix
 
-    if options.serve_static_files:
-        wm_dir = IDOM_WEB_MODULES_DIR.current
-        web_module_files = StaticFiles(directory=wm_dir, html=True, check_dir=False)
-        app.mount(url_prefix + "/_api/modules", web_module_files)
-        app.mount(url_prefix + "/{_:path}/_api/modules", web_module_files)
-
-        # register this last so it takes least priority
-        app.mount(url_prefix + "/", single_page_app_files())
-
-
-def single_page_app_files() -> Callable[..., Awaitable[None]]:
-    static_files_app = StaticFiles(
-        directory=CLIENT_BUILD_DIR,
-        html=True,
-        check_dir=False,
+    app.mount(
+        str(MODULES_PATH),
+        StaticFiles(directory=IDOM_WEB_MODULES_DIR.current, check_dir=False),
     )
+    app.mount(
+        str(ASSETS_PATH),
+        StaticFiles(directory=CLIENT_BUILD_DIR / "assets", check_dir=False),
+    )
+    # register this last so it takes least priority
+    index_route = _make_index_route(options)
+    app.add_route(url_prefix + "/", index_route)
+    app.add_route(url_prefix + "/{path:path}", index_route)
 
-    async def spa_app(scope: Scope, receive: Receive, send: Send) -> None:
-        # Path safety is the responsibility of starlette.staticfiles.StaticFiles -
-        # using `safe_client_build_dir_path` is for convenience in this case.
-        path = safe_client_build_dir_path(scope["path"]).name
-        return await static_files_app({**scope, "path": path}, receive, send)
 
-    return spa_app
+def _make_index_route(options: Options) -> Callable[[Request], Awaitable[HTMLResponse]]:
+    index_html = read_client_index_html(options)
+
+    async def serve_index(request: Request) -> HTMLResponse:
+        return HTMLResponse(index_html)
+
+    return serve_index
 
 
 def _setup_single_view_dispatcher_route(
     options: Options, app: Starlette, constructor: RootComponentConstructor
 ) -> None:
-    @app.websocket_route(options.url_prefix + "/_api/stream")
-    @app.websocket_route(options.url_prefix + "/{path:path}/_api/stream")
+    @app.websocket_route(str(STREAM_PATH))
+    @app.websocket_route(f"{STREAM_PATH}/{{path:path}}")
     async def model_stream(socket: WebSocket) -> None:
         await socket.accept()
         send, recv = _make_send_recv_callbacks(socket)
+
+        pathname = "/" + socket.scope["path_params"].get("path", "")
+        pathname = pathname[len(options.url_prefix) :] or "/"
+        search = socket.scope["query_string"].decode()
+
         try:
             await serve_json_patch(
-                Layout(WebSocketContext(constructor(), value=socket)),
+                Layout(
+                    ConnectionContext(
+                        constructor(),
+                        value=Connection(
+                            scope=socket.scope,
+                            location=Location(pathname, f"?{search}" if search else ""),
+                            carrier=socket,
+                        ),
+                    )
+                ),
                 send,
                 recv,
             )

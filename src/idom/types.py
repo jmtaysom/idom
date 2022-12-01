@@ -4,7 +4,8 @@
 - :mod:`idom.backend.types`
 """
 
-from .backend.types import BackendImplementation, Location
+from .backend.types import BackendImplementation, Connection, Location
+from .core.component import Component
 from .core.hooks import Context
 from .core.types import (
     ComponentConstructor,
@@ -17,6 +18,7 @@ from .core.types import (
     Key,
     LayoutType,
     RootComponentConstructor,
+    State,
     VdomAttributes,
     VdomAttributesAndChildren,
     VdomChild,
@@ -27,8 +29,11 @@ from .core.types import (
 
 
 __all__ = [
+    "BackendImplementation",
+    "Component",
     "ComponentConstructor",
     "ComponentType",
+    "Connection",
     "Context",
     "EventHandlerDict",
     "EventHandlerFunc",
@@ -39,11 +44,11 @@ __all__ = [
     "LayoutType",
     "Location",
     "RootComponentConstructor",
+    "State",
     "VdomAttributes",
     "VdomAttributesAndChildren",
     "VdomChild",
     "VdomChildren",
     "VdomDict",
     "VdomJson",
-    "BackendImplementation",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -9,8 +10,8 @@ from playwright.async_api import async_playwright
 
 from idom.config import IDOM_TESTING_DEFAULT_TIMEOUT
 from idom.testing import (
+    BackendFixture,
     DisplayFixture,
-    ServerFixture,
     capture_idom_logs,
     clear_idom_web_modules_dir,
 )
@@ -34,7 +35,7 @@ async def display(server, page):
 
 @pytest.fixture(scope="session")
 async def server():
-    async with ServerFixture() as server:
+    async with BackendFixture() as server:
         yield server
 
 
@@ -50,14 +51,14 @@ async def page(browser):
 
 @pytest.fixture(scope="session")
 async def browser(pytestconfig: Config):
-    if os.name == "nt":  # pragma: no cover
-        pytest.skip("Browser tests not supported on Windows")
     async with async_playwright() as pw:
         yield await pw.chromium.launch(headless=not bool(pytestconfig.option.headed))
 
 
 @pytest.fixture(scope="session")
 def event_loop():
+    if os.name == "nt":  # pragma: no cover
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     with open_event_loop() as loop:
         yield loop
 

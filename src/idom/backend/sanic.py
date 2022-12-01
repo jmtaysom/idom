@@ -4,18 +4,16 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from typing import Any, MutableMapping, Tuple
 from urllib import parse as urllib_parse
 from uuid import uuid4
 
 from sanic import Blueprint, Sanic, request, response
 from sanic.config import Config
-from sanic.models.asgi import ASGIScope
+from sanic.server.websockets.connection import WebSocketConnection
 from sanic_cors import CORS
-from websockets.legacy.protocol import WebSocketCommonProtocol
 
-from idom.backend.types import Location
-from idom.core.hooks import Context, create_context, use_context
+from idom.backend.types import Connection, Location
 from idom.core.layout import Layout, LayoutEvent
 from idom.core.serve import (
     RecvCoroutine,
@@ -26,15 +24,22 @@ from idom.core.serve import (
 )
 from idom.core.types import RootComponentConstructor
 
-from ._asgi import serve_development_asgi
-from .utils import safe_client_build_dir_path, safe_web_modules_dir_path
+from ._common import (
+    ASSETS_PATH,
+    MODULES_PATH,
+    PATH_PREFIX,
+    STREAM_PATH,
+    CommonOptions,
+    read_client_index_html,
+    safe_client_build_dir_path,
+    safe_web_modules_dir_path,
+    serve_development_asgi,
+)
+from .hooks import ConnectionContext
+from .hooks import use_connection as _use_connection
 
 
 logger = logging.getLogger(__name__)
-
-ConnectionContext: type[Context[Connection | None]] = create_context(
-    None, "ConnectionContext"
-)
 
 
 def configure(
@@ -42,14 +47,14 @@ def configure(
 ) -> None:
     """Configure an application instance to display the given component"""
     options = options or Options()
-    blueprint = Blueprint(f"idom_dispatcher_{id(app)}", url_prefix=options.url_prefix)
 
-    _setup_common_routes(blueprint, options)
+    spa_bp = Blueprint(f"idom_spa_{id(app)}", url_prefix=options.url_prefix)
+    api_bp = Blueprint(f"idom_api_{id(app)}", url_prefix=str(PATH_PREFIX))
 
-    # this route should take priority so set up it up first
-    _setup_single_view_dispatcher_route(blueprint, component)
+    _setup_common_routes(api_bp, spa_bp, options)
+    _setup_single_view_dispatcher_route(api_bp, component, options)
 
-    app.blueprint(blueprint)
+    app.blueprint([spa_bp, api_bp])
 
 
 def create_development_app() -> Sanic:
@@ -67,119 +72,128 @@ async def serve_development_app(
     await serve_development_asgi(app, host, port, started)
 
 
-def use_location() -> Location:
-    """Get the current route as a string"""
-    conn = use_connection()
-    search = conn.request.query_string
-    return Location(pathname="/" + conn.path, search="?" + search if search else "")
-
-
-def use_scope() -> ASGIScope:
-    """Get the current ASGI scope"""
-    app = use_request().app
-    try:
-        asgi_app = app._asgi_app
-    except AttributeError:  # pragma: no cover
-        raise RuntimeError("No scope. Sanic may not be running with an ASGI server")
-    return asgi_app.transport.scope
-
-
 def use_request() -> request.Request:
     """Get the current ``Request``"""
-    return use_connection().request
+    return use_connection().carrier.request
 
 
-def use_connection() -> Connection:
+def use_websocket() -> WebSocketConnection:
+    """Get the current websocket"""
+    return use_connection().carrier.websocket
+
+
+def use_connection() -> Connection[_SanicCarrier]:
     """Get the current :class:`Connection`"""
-    connection = use_context(ConnectionContext)
-    if connection is None:
-        raise RuntimeError(  # pragma: no cover
-            "No connection. Are you running with a Sanic server?"
+    conn = _use_connection()
+    if not isinstance(conn.carrier, _SanicCarrier):
+        raise TypeError(  # pragma: no cover
+            f"Connection has unexpected carrier {conn.carrier}. "
+            "Are you running with a Sanic server?"
         )
-    return connection
+    return conn
 
 
 @dataclass
-class Connection:
-    """A simple wrapper for holding connection information"""
+class Options(CommonOptions):
+    """Render server config for :func:`idom.backend.sanic.configure`"""
 
-    request: request.Request
-    """The current request object"""
-
-    websocket: WebSocketCommonProtocol
-    """A handle to the current websocket"""
-
-    path: str
-    """The current path being served"""
-
-
-@dataclass
-class Options:
-    """Options for :class:`SanicRenderServer`"""
-
-    cors: Union[bool, Dict[str, Any]] = False
+    cors: bool | dict[str, Any] = False
     """Enable or configure Cross Origin Resource Sharing (CORS)
 
     For more information see docs for ``sanic_cors.CORS``
     """
 
-    serve_static_files: bool = True
-    """Whether or not to serve static files (i.e. web modules)"""
 
-    url_prefix: str = ""
-    """The URL prefix where IDOM resources will be served from"""
-
-
-def _setup_common_routes(blueprint: Blueprint, options: Options) -> None:
+def _setup_common_routes(
+    api_blueprint: Blueprint,
+    spa_blueprint: Blueprint,
+    options: Options,
+) -> None:
     cors_options = options.cors
     if cors_options:  # pragma: no cover
         cors_params = cors_options if isinstance(cors_options, dict) else {}
-        CORS(blueprint, **cors_params)
+        CORS(api_blueprint, **cors_params)
 
-    if options.serve_static_files:
+    index_html = read_client_index_html(options)
 
-        async def single_page_app_files(
-            request: request.Request,
-            path: str = "",
-        ) -> response.HTTPResponse:
-            path = urllib_parse.unquote(path)
-            return await response.file(safe_client_build_dir_path(path))
+    async def single_page_app_files(
+        request: request.Request,
+        _: str = "",
+    ) -> response.HTTPResponse:
+        return response.html(index_html)
 
-        blueprint.add_route(single_page_app_files, "/")
-        blueprint.add_route(single_page_app_files, "/<path:path>")
+    spa_blueprint.add_route(single_page_app_files, "/")
+    spa_blueprint.add_route(single_page_app_files, "/<_:path>")
 
-        async def web_module_files(
-            request: request.Request,
-            path: str,
-            _: str = "",  # this is not used
-        ) -> response.HTTPResponse:
-            path = urllib_parse.unquote(path)
-            return await response.file(safe_web_modules_dir_path(path))
+    async def asset_files(
+        request: request.Request,
+        path: str = "",
+    ) -> response.HTTPResponse:
+        path = urllib_parse.unquote(path)
+        return await response.file(safe_client_build_dir_path(f"assets/{path}"))
 
-        blueprint.add_route(web_module_files, "/_api/modules/<path:path>")
-        blueprint.add_route(web_module_files, "/<_:path>/_api/modules/<path:path>")
+    api_blueprint.add_route(asset_files, f"/{ASSETS_PATH.name}/<path:path>")
+
+    async def web_module_files(
+        request: request.Request,
+        path: str,
+        _: str = "",  # this is not used
+    ) -> response.HTTPResponse:
+        path = urllib_parse.unquote(path)
+        return await response.file(
+            safe_web_modules_dir_path(path),
+            mime_type="text/javascript",
+        )
+
+    api_blueprint.add_route(web_module_files, f"/{MODULES_PATH.name}/<path:path>")
 
 
 def _setup_single_view_dispatcher_route(
-    blueprint: Blueprint, constructor: RootComponentConstructor
+    api_blueprint: Blueprint,
+    constructor: RootComponentConstructor,
+    options: Options,
 ) -> None:
     async def model_stream(
-        request: request.Request, socket: WebSocketCommonProtocol, path: str = ""
+        request: request.Request, socket: WebSocketConnection, path: str = ""
     ) -> None:
+        app = request.app
+        try:
+            asgi_app = app._asgi_app
+        except AttributeError:  # pragma: no cover
+            logger.warning("No scope. Sanic may not be running with an ASGI server")
+            scope: MutableMapping[str, Any] = {}
+        else:
+            scope = asgi_app.transport.scope
+
         send, recv = _make_send_recv_callbacks(socket)
-        conn = Connection(request, socket, path)
         await serve_json_patch(
-            Layout(ConnectionContext(constructor(), value=conn)),
+            Layout(
+                ConnectionContext(
+                    constructor(),
+                    value=Connection(
+                        scope=scope,
+                        location=Location(
+                            pathname=f"/{path[len(options.url_prefix):]}",
+                            search=(
+                                f"?{request.query_string}"
+                                if request.query_string
+                                else ""
+                            ),
+                        ),
+                        carrier=_SanicCarrier(request, socket),
+                    ),
+                )
+            ),
             send,
             recv,
         )
 
-    blueprint.add_websocket_route(model_stream, "/_api/stream")
-    blueprint.add_websocket_route(model_stream, "/<path:path>/_api/stream")
+    api_blueprint.add_websocket_route(model_stream, f"/{STREAM_PATH.name}")
+    api_blueprint.add_websocket_route(model_stream, f"/{STREAM_PATH.name}/<path:path>/")
 
 
 def _make_send_recv_callbacks(
-    socket: WebSocketCommonProtocol,
+    socket: WebSocketConnection,
 ) -> Tuple[SendCoroutine, RecvCoroutine]:
     async def sock_send(value: VdomJsonPatch) -> None:
         await socket.send(json.dumps(value))
@@ -191,3 +205,14 @@ def _make_send_recv_callbacks(
         return LayoutEvent(**json.loads(data))
 
     return sock_send, sock_recv
+
+
+@dataclass
+class _SanicCarrier:
+    """A simple wrapper for holding connection information"""
+
+    request: request.Request
+    """The current request object"""
+
+    websocket: WebSocketConnection
+    """A handle to the current websocket"""

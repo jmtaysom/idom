@@ -80,7 +80,7 @@ def use_linked_inputs(
     value, set_value = idom.hooks.use_state(initial_value)
 
     def sync_inputs(event: Dict[str, Any]) -> None:
-        new_value = event["value"]
+        new_value = event["target"]["value"]
         set_value(new_value)
         if not new_value and ignore_empty:
             return None
@@ -187,5 +187,5 @@ _Func = Callable[..., Any]
 
 
 def _use_callable(initial_func: _Func) -> Tuple[_Func, Callable[[_Func], None]]:
-    state = hooks.use_state(lambda: initial_func)
-    return state[0], lambda new: state[1](lambda old: new)
+    state, set_state = hooks.use_state(lambda: initial_func)
+    return state, lambda new: set_state(lambda old: new)

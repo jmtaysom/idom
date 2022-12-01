@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, NoReturn
 
 from idom.types import RootComponentConstructor
 
-from .types import BackendImplementation, Location
+from .types import BackendImplementation
 from .utils import all_implementations
 
 
@@ -23,6 +23,11 @@ def create_development_app() -> Any:
     return _default_implementation().create_development_app()
 
 
+def Options(*args: Any, **kwargs: Any) -> NoReturn:
+    """Create configuration options"""
+    raise ValueError("Default implementation has no options.")  # pragma: no cover
+
+
 async def serve_development_app(
     app: Any,
     host: str,
@@ -33,16 +38,6 @@ async def serve_development_app(
     return await _default_implementation().serve_development_app(
         app, host, port, started
     )
-
-
-def use_scope() -> Any:
-    """Return the current ASGI/WSGI scope"""
-    return _default_implementation().use_scope()
-
-
-def use_location() -> Location:
-    """Return the current route as a string"""
-    return _default_implementation().use_location()
 
 
 _DEFAULT_IMPLEMENTATION: BackendImplementation[Any] | None = None

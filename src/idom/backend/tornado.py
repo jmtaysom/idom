@@ -4,7 +4,6 @@ import asyncio
 import json
 from asyncio import Queue as AsyncQueue
 from asyncio.futures import Future
-from dataclasses import dataclass
 from typing import Any, List, Tuple, Type, Union
 from urllib.parse import urljoin
 
@@ -16,34 +15,39 @@ from tornado.web import Application, RequestHandler, StaticFileHandler
 from tornado.websocket import WebSocketHandler
 from tornado.wsgi import WSGIContainer
 
-from idom.backend.types import Location
+from idom.backend.types import Connection, Location
 from idom.config import IDOM_WEB_MODULES_DIR
-from idom.core.hooks import Context, create_context, use_context
 from idom.core.layout import Layout, LayoutEvent
 from idom.core.serve import VdomJsonPatch, serve_json_patch
 from idom.core.types import ComponentConstructor
 
-from .utils import CLIENT_BUILD_DIR, safe_client_build_dir_path
-
-
-ConnectionContext: type[Context[Connection | None]] = create_context(
-    None, "ConnectionContext"
+from ._common import (
+    ASSETS_PATH,
+    CLIENT_BUILD_DIR,
+    MODULES_PATH,
+    STREAM_PATH,
+    CommonOptions,
+    read_client_index_html,
 )
+from .hooks import ConnectionContext
+from .hooks import use_connection as _use_connection
+
+
+Options = CommonOptions
+"""Render server config for :func:`idom.backend.tornado.configure`"""
 
 
 def configure(
     app: Application,
     component: ComponentConstructor,
-    options: Options | None = None,
+    options: CommonOptions | None = None,
 ) -> None:
-    """Return a :class:`TornadoServer` where each client has its own state.
-
-    Implements the :class:`~idom.server.proto.ServerFactory` protocol
+    """Configure the necessary IDOM routes on the given app.
 
     Parameters:
-        app: A tornado ``Application`` instance.
-        component: A root component constructor
-        options: Options for configuring how the component is mounted to the server.
+        app: An application instance
+        component: A component constructor
+        options: Options for configuring server behavior
     """
     options = options or Options()
     _add_handler(
@@ -51,7 +55,7 @@ def configure(
         options,
         (
             # this route should take priority so set up it up first
-            _setup_single_view_dispatcher_route(component)
+            _setup_single_view_dispatcher_route(component, options)
             + _setup_common_routes(options)
         ),
     )
@@ -69,8 +73,7 @@ async def serve_development_app(
 ) -> None:
     enable_pretty_logging()
 
-    # setup up tornado to use asyncio
-    AsyncIOMainLoop().install()
+    AsyncIOMainLoop.current().install()
 
     server = HTTPServer(app)
     server.listen(port, host)
@@ -81,7 +84,7 @@ async def serve_development_app(
 
     try:
         # block forever - tornado has already set up its own background tasks
-        await asyncio.get_event_loop().create_future()
+        await asyncio.get_running_loop().create_future()
     finally:
         # stop accepting new connections
         server.stop()
@@ -89,79 +92,42 @@ async def serve_development_app(
         await server.close_all_connections()
 
 
-def use_location() -> Location:
-    """Get the current route as a string"""
-    conn = use_connection()
-    search = conn.request.query
-    return Location(pathname="/" + conn.path, search="?" + search if search else "")
-
-
-def use_scope() -> dict[str, Any]:
-    """Get the current WSGI environment dictionary"""
-    return WSGIContainer.environ(use_request())
-
-
 def use_request() -> HTTPServerRequest:
     """Get the current ``HTTPServerRequest``"""
-    return use_connection().request
+    return use_connection().carrier
 
 
-def use_connection() -> Connection:
-    connection = use_context(ConnectionContext)
-    if connection is None:
-        raise RuntimeError(  # pragma: no cover
-            "No connection. Are you running with a Tornado server?"
+def use_connection() -> Connection[HTTPServerRequest]:
+    conn = _use_connection()
+    if not isinstance(conn.carrier, HTTPServerRequest):
+        raise TypeError(  # pragma: no cover
+            f"Connection has unexpected carrier {conn.carrier}. "
+            "Are you running with a Flask server?"
         )
-    return connection
-
-
-@dataclass
-class Connection:
-    """A simple wrapper for holding connection information"""
-
-    request: HTTPServerRequest
-    """The current request object"""
-
-    path: str
-    """The current path being served"""
-
-
-@dataclass
-class Options:
-    """Render server options for :class:`TornadoRenderServer` subclasses"""
-
-    serve_static_files: bool = True
-    """Whether or not to serve static files (i.e. web modules)"""
-
-    url_prefix: str = ""
-    """The URL prefix where IDOM resources will be served from"""
+    return conn
 
 
 _RouteHandlerSpecs = List[Tuple[str, Type[RequestHandler], Any]]
 
 
 def _setup_common_routes(options: Options) -> _RouteHandlerSpecs:
-    handlers: _RouteHandlerSpecs = []
-
-    if options.serve_static_files:
-        handlers.append(
-            (
-                r"/.*/?_api/modules/(.*)",
-                StaticFileHandler,
-                {"path": str(IDOM_WEB_MODULES_DIR.current)},
-            )
-        )
-
-        # register last to give lowest priority
-        handlers.append(
-            (
-                r"/(.*)",
-                SpaStaticFileHandler,
-                {"path": str(CLIENT_BUILD_DIR)},
-            )
-        )
-
-    return handlers
+    return [
+        (
+            rf"{MODULES_PATH}/(.*)",
+            StaticFileHandler,
+            {"path": str(IDOM_WEB_MODULES_DIR.current)},
+        ),
+        (
+            rf"{ASSETS_PATH}/(.*)",
+            StaticFileHandler,
+            {"path": str(CLIENT_BUILD_DIR / "assets")},
+        ),
+        (
+            r"/(.*)",
+            IndexHandler,
+            {"index_html": read_client_index_html(options)},
+        ),
+    ]
 
 
 def _add_handler(
@@ -175,27 +141,31 @@ def _add_handler(
 
 
 def _setup_single_view_dispatcher_route(
-    constructor: ComponentConstructor,
+    constructor: ComponentConstructor, options: Options
 ) -> _RouteHandlerSpecs:
     return [
         (
-            r"/(.*)/_api/stream",
+            rf"{STREAM_PATH}/(.*)",
             ModelStreamHandler,
-            {"component_constructor": constructor},
+            {"component_constructor": constructor, "url_prefix": options.url_prefix},
         ),
         (
-            r"/_api/stream",
+            str(STREAM_PATH),
             ModelStreamHandler,
-            {"component_constructor": constructor},
+            {"component_constructor": constructor, "url_prefix": options.url_prefix},
         ),
     ]
 
 
-class SpaStaticFileHandler(StaticFileHandler):
-    async def get(self, path: str, include_body: bool = True) -> None:
-        # Path safety is the responsibility of tornado.web.StaticFileHandler -
-        # using `safe_client_build_dir_path` is for convenience in this case.
-        return await super().get(safe_client_build_dir_path(path).name, include_body)
+class IndexHandler(RequestHandler):
+
+    _index_html: str
+
+    def initialize(self, index_html: str) -> None:
+        self._index_html = index_html
+
+    async def get(self, _: str) -> None:
+        self.finish(self._index_html)
 
 
 class ModelStreamHandler(WebSocketHandler):
@@ -204,8 +174,11 @@ class ModelStreamHandler(WebSocketHandler):
     _dispatch_future: Future[None]
     _message_queue: AsyncQueue[str]
 
-    def initialize(self, component_constructor: ComponentConstructor) -> None:
+    def initialize(
+        self, component_constructor: ComponentConstructor, url_prefix: str
+    ) -> None:
         self._component_constructor = component_constructor
+        self._url_prefix = url_prefix
 
     async def open(self, path: str = "", *args: Any, **kwargs: Any) -> None:
         message_queue: "AsyncQueue[str]" = AsyncQueue()
@@ -222,7 +195,18 @@ class ModelStreamHandler(WebSocketHandler):
                 Layout(
                     ConnectionContext(
                         self._component_constructor(),
-                        value=Connection(self.request, path),
+                        value=Connection(
+                            scope=WSGIContainer.environ(self.request),
+                            location=Location(
+                                pathname=f"/{path[len(self._url_prefix):]}",
+                                search=(
+                                    f"?{self.request.query}"
+                                    if self.request.query
+                                    else ""
+                                ),
+                            ),
+                            carrier=self.request,
+                        ),
                     )
                 ),
                 send,

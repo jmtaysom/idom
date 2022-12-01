@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 from fastjsonschema import JsonSchemaException
 
@@ -213,6 +215,9 @@ def test_valid_vdom(value):
     validate_vdom_json(value)
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 10), reason="error messages are different in Python<3.10"
+)
 @pytest.mark.parametrize(
     "value, error_message_pattern",
     [
@@ -230,34 +235,34 @@ def test_valid_vdom(value):
         ),
         (
             {"tagName": "tag", "children": None},
-            r"data must be array",
+            r"data\.children must be array",
         ),
         (
             {"tagName": "tag", "children": [None]},
-            r"data must be object or string",
+            r"data\.children\[{data_x}\] must be object or string",
         ),
         (
             {"tagName": "tag", "children": [{"tagName": None}]},
-            r"data\.tagName must be string",
+            r"data\.children\[{data_x}\]\.tagName must be string",
         ),
         (
             {"tagName": "tag", "attributes": None},
-            r"data.attributes must be object",
+            r"data\.attributes must be object",
         ),
         (
             {"tagName": "tag", "eventHandlers": None},
-            r"data must be object",
+            r"data\.eventHandlers must be object",
         ),
         (
             {"tagName": "tag", "eventHandlers": {"onEvent": None}},
-            r"data must be object",
+            r"data\.eventHandlers\.{data_key} must be object",
         ),
         (
             {
                 "tagName": "tag",
                 "eventHandlers": {"onEvent": {}},
             },
-            r"data must contain \['target'\] properties",
+            r"data\.eventHandlers\.{data_key}\ must contain \['target'\] properties",
         ),
         (
             {
@@ -269,7 +274,7 @@ def test_valid_vdom(value):
                     }
                 },
             },
-            r"data\.preventDefault must be boolean",
+            r"data\.eventHandlers\.{data_key}\.preventDefault must be boolean",
         ),
         (
             {
@@ -281,45 +286,35 @@ def test_valid_vdom(value):
                     }
                 },
             },
-            r"data\.stopPropagation must be boolean",
+            r"data\.eventHandlers\.{data_key}\.stopPropagation must be boolean",
         ),
         (
             {"tagName": "tag", "importSource": None},
-            r"data must be object",
+            r"data\.importSource must be object",
         ),
         (
             {"tagName": "tag", "importSource": {}},
-            r"data must contain \['source'\] properties",
+            r"data\.importSource must contain \['source'\] properties",
         ),
         (
             {
                 "tagName": "tag",
                 "importSource": {"source": "something", "fallback": 0},
             },
-            r"data\.fallback must be object or string or null",
+            r"data\.importSource\.fallback must be object or string or null",
         ),
         (
             {
                 "tagName": "tag",
                 "importSource": {"source": "something", "fallback": {"tagName": None}},
             },
-            r"data.tagName must be string",
+            r"data\.importSource\.fallback\.tagName must be string",
         ),
     ],
 )
 def test_invalid_vdom(value, error_message_pattern):
     with pytest.raises(JsonSchemaException, match=error_message_pattern):
         validate_vdom_json(value)
-
-
-@pytest.mark.skipif(not IDOM_DEBUG_MODE.current, reason="Only logs in debug mode")
-def test_debug_log_if_children_in_attributes(caplog):
-    idom.vdom("div", {"children": ["hello"]})
-    assert len(caplog.records) == 1
-    assert caplog.records[0].message.startswith(
-        "Reserved key 'children' found in attributes"
-    )
-    caplog.records.clear()
 
 
 @pytest.mark.skipif(not IDOM_DEBUG_MODE.current, reason="Only logs in debug mode")

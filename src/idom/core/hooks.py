@@ -8,7 +8,6 @@ from typing import (
     Any,
     Awaitable,
     Callable,
-    ClassVar,
     Dict,
     Generic,
     List,
@@ -28,7 +27,7 @@ from idom.config import IDOM_DEBUG_MODE
 from idom.utils import Ref
 
 from ._thread_local import ThreadLocal
-from .types import ComponentType, Key, VdomDict
+from .types import ComponentType, Key, State, VdomDict
 from .vdom import vdom
 
 
@@ -48,35 +47,20 @@ __all__ = [
 
 logger = getLogger(__name__)
 
-_StateType = TypeVar("_StateType")
+_Type = TypeVar("_Type")
 
 
 @overload
-def use_state(
-    initial_value: Callable[[], _StateType],
-) -> Tuple[
-    _StateType,
-    Callable[[_StateType | Callable[[_StateType], _StateType]], None],
-]:
+def use_state(initial_value: Callable[[], _Type]) -> State[_Type]:
     ...
 
 
 @overload
-def use_state(
-    initial_value: _StateType,
-) -> Tuple[
-    _StateType,
-    Callable[[_StateType | Callable[[_StateType], _StateType]], None],
-]:
+def use_state(initial_value: _Type) -> State[_Type]:
     ...
 
 
-def use_state(
-    initial_value: _StateType | Callable[[], _StateType],
-) -> Tuple[
-    _StateType,
-    Callable[[_StateType | Callable[[_StateType], _StateType]], None],
-]:
+def use_state(initial_value: _Type | Callable[[], _Type]) -> State[_Type]:
     """See the full :ref:`Use State` docs for details
 
     Parameters:
@@ -89,16 +73,16 @@ def use_state(
         A tuple containing the current state and a function to update it.
     """
     current_state = _use_const(lambda: _CurrentState(initial_value))
-    return current_state.value, current_state.dispatch
+    return State(current_state.value, current_state.dispatch)
 
 
-class _CurrentState(Generic[_StateType]):
+class _CurrentState(Generic[_Type]):
 
     __slots__ = "value", "dispatch"
 
     def __init__(
         self,
-        initial_value: Union[_StateType, Callable[[], _StateType]],
+        initial_value: Union[_Type, Callable[[], _Type]],
     ) -> None:
         if callable(initial_value):
             self.value = initial_value()
@@ -107,14 +91,12 @@ class _CurrentState(Generic[_StateType]):
 
         hook = current_hook()
 
-        def dispatch(
-            new: Union[_StateType, Callable[[_StateType], _StateType]]
-        ) -> None:
+        def dispatch(new: Union[_Type, Callable[[_Type], _Type]]) -> None:
             if callable(new):
                 next_value = new(self.value)
             else:
                 next_value = new
-            if next_value is not self.value:
+            if not strictly_equal(next_value, self.value):
                 self.value = next_value
                 hook.schedule_render()
 
@@ -227,129 +209,112 @@ def use_debug_value(
             :func:`id` is different). By default these are inferred based on local
             variables that are referenced by the given function.
     """
-    if not IDOM_DEBUG_MODE.current:
-        return  # pragma: no cover
-
     old: Ref[Any] = _use_const(lambda: Ref(object()))
     memo_func = message if callable(message) else lambda: message
     new = use_memo(memo_func, dependencies)
 
-    if old.current != new:
+    if IDOM_DEBUG_MODE.current and old.current != new:
         old.current = new
         logger.debug(f"{current_hook().component} {new}")
 
 
-def create_context(
-    default_value: _StateType, name: str | None = None
-) -> type[Context[_StateType]]:
+def create_context(default_value: _Type) -> Context[_Type]:
     """Return a new context type for use in :func:`use_context`"""
 
-    class _Context(Context[_StateType]):
-        _default_value = default_value
+    def context(
+        *children: Any,
+        value: _Type = default_value,
+        key: Key | None = None,
+    ) -> ContextProvider[_Type]:
+        return ContextProvider(
+            *children,
+            value=value,
+            key=key,
+            type=context,
+        )
 
-    _Context.__name__ = name or "Context"
+    context.__qualname__ = "context"
 
-    return _Context
+    return context
 
 
-def use_context(context_type: type[Context[_StateType]]) -> _StateType:
+class Context(Protocol[_Type]):
+    """Returns a :class:`ContextProvider` component"""
+
+    def __call__(
+        self,
+        *children: Any,
+        value: _Type = ...,
+        key: Key | None = ...,
+    ) -> ContextProvider[_Type]:
+        ...
+
+
+def use_context(context: Context[_Type]) -> _Type:
     """Get the current value for the given context type.
 
     See the full :ref:`Use Context` docs for more information.
     """
-    # We have to use a Ref here since, if initially context_type._current is None, and
-    # then on a subsequent render it is present, we need to be able to dynamically adopt
-    # that newly present current context. When we update it though, we don't need to
-    # schedule a new render since we're already rending right now. Thus we can't do this
-    # with use_state() since we'd incur an extra render when calling set_state.
-    context_ref: Ref[Context[_StateType] | None] = use_ref(None)
-
-    if context_ref.current is None:
-        provided_context = context_type._current.get()
-        if provided_context is None:
-            # Cast required because of: https://github.com/python/mypy/issues/5144
-            return cast(_StateType, context_type._default_value)
-        context_ref.current = provided_context
-
-    # We need the hook now so that we can schedule an update when
     hook = current_hook()
+    provider = hook.get_context_provider(context)
 
-    context = context_ref.current
+    if provider is None:
+        # force type checker to realize this is just a normal function
+        assert isinstance(context, FunctionType), f"{context} is not a Context"
+        # __kwdefault__ can be None if no kwarg only parameters exist
+        assert context.__kwdefaults__ is not None, f"{context} has no 'value' kwarg"
+        # lastly check that 'value' kwarg exists
+        assert "value" in context.__kwdefaults__, f"{context} has no 'value' kwarg"
+        # then we can safely access the context's default value
+        return cast(_Type, context.__kwdefaults__["value"])
+
+    subscribers = provider._subscribers
 
     @use_effect
     def subscribe_to_context_change() -> Callable[[], None]:
-        def set_context(new: Context[_StateType]) -> None:
-            # We don't need to check if `new is not context_ref.current` because we only
-            # trigger this callback when the value of a context, and thus the context
-            # itself changes. Therefore we can always schedule a render.
-            context_ref.current = new
-            hook.schedule_render()
+        subscribers.add(hook)
+        return lambda: subscribers.remove(hook)
 
-        context.subscribers.add(set_context)
-        return lambda: context.subscribers.remove(set_context)
-
-    return context.value
+    return provider._value
 
 
-_UNDEFINED: Any = object()
-
-
-class Context(Generic[_StateType]):
-
-    # This should be _StateType instead of Any, but it can't due to this limitation:
-    # https://github.com/python/mypy/issues/5144
-    _default_value: ClassVar[Any]
-
-    _current: ClassVar[ThreadLocal[Context[Any] | None]]
-
-    def __init_subclass__(cls) -> None:
-        # every context type tracks which of its instances are currently in use
-        cls._current = ThreadLocal(lambda: None)
-
+class ContextProvider(Generic[_Type]):
     def __init__(
         self,
         *children: Any,
-        value: _StateType = _UNDEFINED,
-        key: Key | None = None,
+        value: _Type,
+        key: Key | None,
+        type: Context[_Type],
     ) -> None:
         self.children = children
-        self.value: _StateType = self._default_value if value is _UNDEFINED else value
         self.key = key
-        self.subscribers: set[Callable[[Context[_StateType]], None]] = set()
-        self.type = self.__class__
+        self.type = type
+        self._subscribers: set[LifeCycleHook] = set()
+        self._value = value
 
     def render(self) -> VdomDict:
-        current_ctx = self.__class__._current
-
-        prior_ctx = current_ctx.get()
-        current_ctx.set(self)
-
-        def reset_ctx() -> None:
-            current_ctx.set(prior_ctx)
-
-        current_hook().add_effect(COMPONENT_DID_RENDER_EFFECT, reset_ctx)
-
+        current_hook().set_context_provider(self)
         return vdom("", *self.children)
 
-    def should_render(self, new: Context[_StateType]) -> bool:
-        if self.value is not new.value:
-            new.subscribers.update(self.subscribers)
-            for set_context in self.subscribers:
-                set_context(new)
+    def should_render(self, new: ContextProvider[_Type]) -> bool:
+        if not strictly_equal(self._value, new._value):
+            for hook in self._subscribers:
+                hook.set_context_provider(new)
+                hook.schedule_render()
             return True
         return False
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({id(self)})"
+        return f"{type(self).__name__}({self.type})"
 
 
 _ActionType = TypeVar("_ActionType")
 
 
 def use_reducer(
-    reducer: Callable[[_StateType, _ActionType], _StateType],
-    initial_value: _StateType,
-) -> Tuple[_StateType, Callable[[_ActionType], None]]:
+    reducer: Callable[[_Type, _ActionType], _Type],
+    initial_value: _Type,
+) -> Tuple[_Type, Callable[[_ActionType], None]]:
     """See the full :ref:`Use Reducer` docs for details
 
     Parameters:
@@ -367,8 +332,8 @@ def use_reducer(
 
 
 def _create_dispatcher(
-    reducer: Callable[[_StateType, _ActionType], _StateType],
-    set_state: Callable[[Callable[[_StateType], _StateType]], None],
+    reducer: Callable[[_Type, _ActionType], _Type],
+    set_state: Callable[[Callable[[_Type], _Type]], None],
 ) -> Callable[[_ActionType], None]:
     def dispatch(action: _ActionType) -> None:
         set_state(lambda last_state: reducer(last_state, action))
@@ -428,7 +393,7 @@ def use_callback(
 class _LambdaCaller(Protocol):
     """MyPy doesn't know how to deal with TypeVars only used in function return"""
 
-    def __call__(self, func: Callable[[], _StateType]) -> _StateType:
+    def __call__(self, func: Callable[[], _Type]) -> _Type:
         ...
 
 
@@ -442,16 +407,16 @@ def use_memo(
 
 @overload
 def use_memo(
-    function: Callable[[], _StateType],
+    function: Callable[[], _Type],
     dependencies: Sequence[Any] | ellipsis | None = ...,
-) -> _StateType:
+) -> _Type:
     ...
 
 
 def use_memo(
-    function: Optional[Callable[[], _StateType]] = None,
+    function: Optional[Callable[[], _Type]] = None,
     dependencies: Sequence[Any] | ellipsis | None = ...,
-) -> Union[_StateType, Callable[[Callable[[], _StateType]], _StateType]]:
+) -> Union[_Type, Callable[[Callable[[], _Type]], _Type]]:
     """See the full :ref:`Use Memo` docs for details
 
     Parameters:
@@ -468,7 +433,7 @@ def use_memo(
     """
     dependencies = _try_to_infer_closure_values(function, dependencies)
 
-    memo: _Memo[_StateType] = _use_const(_Memo)
+    memo: _Memo[_Type] = _use_const(_Memo)
 
     if memo.empty():
         # we need to initialize on the first run
@@ -480,24 +445,27 @@ def use_memo(
     elif (
         len(memo.deps) != len(dependencies)
         # if deps are same length check identity for each item
-        or any(current is not new for current, new in zip(memo.deps, dependencies))
+        or not all(
+            strictly_equal(current, new)
+            for current, new in zip(memo.deps, dependencies)
+        )
     ):
         memo.deps = dependencies
         changed = True
     else:
         changed = False
 
-    setup: Callable[[Callable[[], _StateType]], _StateType]
+    setup: Callable[[Callable[[], _Type]], _Type]
 
     if changed:
 
-        def setup(function: Callable[[], _StateType]) -> _StateType:
+        def setup(function: Callable[[], _Type]) -> _Type:
             current_value = memo.value = function()
             return current_value
 
     else:
 
-        def setup(function: Callable[[], _StateType]) -> _StateType:
+        def setup(function: Callable[[], _Type]) -> _Type:
             return memo.value
 
     if function is not None:
@@ -506,12 +474,12 @@ def use_memo(
         return setup
 
 
-class _Memo(Generic[_StateType]):
+class _Memo(Generic[_Type]):
     """Simple object for storing memoization data"""
 
     __slots__ = "value", "deps"
 
-    value: _StateType
+    value: _Type
     deps: Sequence[Any]
 
     def empty(self) -> bool:
@@ -523,7 +491,7 @@ class _Memo(Generic[_StateType]):
             return False
 
 
-def use_ref(initial_value: _StateType) -> Ref[_StateType]:
+def use_ref(initial_value: _Type) -> Ref[_Type]:
     """See the full :ref:`Use State` docs for details
 
     Parameters:
@@ -535,7 +503,7 @@ def use_ref(initial_value: _StateType) -> Ref[_StateType]:
     return _use_const(lambda: Ref(initial_value))
 
 
-def _use_const(function: Callable[[], _StateType]) -> _StateType:
+def _use_const(function: Callable[[], _Type]) -> _Type:
     return current_hook().use_state(function)
 
 
@@ -553,19 +521,19 @@ def _try_to_infer_closure_values(
         else:
             return None
     else:
-        return cast("Sequence[Any] | None", values)
+        return values
 
 
 def current_hook() -> LifeCycleHook:
     """Get the current :class:`LifeCycleHook`"""
-    hook = _current_hook.get()
-    if hook is None:
+    hook_stack = _hook_stack.get()
+    if not hook_stack:
         msg = "No life cycle hook is active. Are you rendering in a layout?"
         raise RuntimeError(msg)
-    return hook
+    return hook_stack[-1]
 
 
-_current_hook: ThreadLocal[LifeCycleHook | None] = ThreadLocal(lambda: None)
+_hook_stack: ThreadLocal[list[LifeCycleHook]] = ThreadLocal(list)
 
 
 EffectType = NewType("EffectType", str)
@@ -630,9 +598,8 @@ class LifeCycleHook:
 
             hook.affect_component_did_render()
 
-            # This should only be called after any child components yielded by
-            # component_instance.render() have also been rendered because effects of
-            # this type must run after the full set of changes have been resolved.
+            # This should only be called after the full set of changes associated with a
+            # given render have been completed.
             hook.affect_layout_did_render()
 
             # Typically an event occurs and a new render is scheduled, thus begining
@@ -650,6 +617,7 @@ class LifeCycleHook:
 
     __slots__ = (
         "__weakref__",
+        "_context_providers",
         "_current_state_index",
         "_event_effects",
         "_is_rendering",
@@ -666,6 +634,7 @@ class LifeCycleHook:
         self,
         schedule_render: Callable[[], None],
     ) -> None:
+        self._context_providers: dict[Context[Any], ContextProvider[Any]] = {}
         self._schedule_render_callback = schedule_render
         self._schedule_render_later = False
         self._is_rendering = False
@@ -685,7 +654,7 @@ class LifeCycleHook:
             self._schedule_render()
         return None
 
-    def use_state(self, function: Callable[[], _StateType]) -> _StateType:
+    def use_state(self, function: Callable[[], _Type]) -> _Type:
         if not self._rendered_atleast_once:
             # since we're not intialized yet we're just appending state
             result = function()
@@ -699,6 +668,14 @@ class LifeCycleHook:
     def add_effect(self, effect_type: EffectType, function: Callable[[], None]) -> None:
         """Trigger a function on the occurance of the given effect type"""
         self._event_effects[effect_type].append(function)
+
+    def set_context_provider(self, provider: ContextProvider[Any]) -> None:
+        self._context_providers[provider.type] = provider
+
+    def get_context_provider(
+        self, context: Context[_Type]
+    ) -> ContextProvider[_Type] | None:
+        return self._context_providers.get(context)
 
     def affect_component_will_render(self, component: ComponentType) -> None:
         """The component is about to render"""
@@ -753,13 +730,16 @@ class LifeCycleHook:
         This method is called by a layout before entering the render method
         of this hook's associated component.
         """
-        _current_hook.set(self)
+        hook_stack = _hook_stack.get()
+        if hook_stack:
+            parent = hook_stack[-1]
+            self._context_providers.update(parent._context_providers)
+        hook_stack.append(self)
 
     def unset_current(self) -> None:
         """Unset this hook as the active hook in this thread"""
         # this assertion should never fail - primarilly useful for debug
-        assert _current_hook.get() is self
-        _current_hook.set(None)
+        assert _hook_stack.get().pop() is self
 
     def _schedule_render(self) -> None:
         try:
@@ -768,3 +748,33 @@ class LifeCycleHook:
             logger.exception(
                 f"Failed to schedule render via {self._schedule_render_callback}"
             )
+
+
+def strictly_equal(x: Any, y: Any) -> bool:
+    """Check if two values are identical or, for a limited set or types, equal.
+
+    Only the following types are checked for equality rather than identity:
+
+    - ``int``
+    - ``float``
+    - ``complex``
+    - ``str``
+    - ``bytes``
+    - ``bytearray``
+    - ``memoryview``
+    """
+    return x is y or (type(x) in _NUMERIC_TEXT_BINARY_TYPES and x == y)
+
+
+_NUMERIC_TEXT_BINARY_TYPES = {
+    # numeric
+    int,
+    float,
+    complex,
+    # text
+    str,
+    # binary types
+    bytes,
+    bytearray,
+    memoryview,
+}

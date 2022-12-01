@@ -1,18 +1,21 @@
 import asyncio
-import re
 
 import pytest
 
 import idom
 from idom import html
 from idom.config import IDOM_DEBUG_MODE
-from idom.core.hooks import COMPONENT_DID_RENDER_EFFECT, LifeCycleHook, current_hook
-from idom.core.layout import Layout
-from idom.core.serve import render_json_patch
+from idom.core.hooks import (
+    COMPONENT_DID_RENDER_EFFECT,
+    LifeCycleHook,
+    current_hook,
+    strictly_equal,
+)
+from idom.core.layout import Layout, LayoutUpdate
 from idom.testing import DisplayFixture, HookCatcher, assert_idom_did_log, poll
 from idom.testing.logs import assert_idom_did_not_log
 from idom.utils import Ref
-from tests.tooling.asserts import assert_same_items
+from tests.tooling.common import DEFAULT_TYPE_DELAY
 
 
 async def test_must_be_rendering_in_layout_to_use_hooks():
@@ -38,31 +41,35 @@ async def test_simple_stateful_component():
     sse = SimpleStatefulComponent()
 
     async with idom.Layout(sse) as layout:
-        patch_1 = await render_json_patch(layout)
-        assert patch_1.path == ""
-        assert_same_items(
-            patch_1.changes,
-            [
-                {"op": "add", "path": "/tagName", "value": ""},
-                {
-                    "op": "add",
-                    "path": "/children",
-                    "value": [{"children": ["0"], "tagName": "div"}],
-                },
-            ],
+        update_1 = await layout.render()
+        assert update_1 == LayoutUpdate(
+            path="",
+            old=None,
+            new={
+                "tagName": "",
+                "children": [{"tagName": "div", "children": ["0"]}],
+            },
         )
 
-        patch_2 = await render_json_patch(layout)
-        assert patch_2.path == ""
-        assert patch_2.changes == [
-            {"op": "replace", "path": "/children/0/children/0", "value": "1"}
-        ]
+        update_2 = await layout.render()
+        assert update_2 == LayoutUpdate(
+            path="",
+            old=update_1.new,
+            new={
+                "tagName": "",
+                "children": [{"tagName": "div", "children": ["1"]}],
+            },
+        )
 
-        patch_3 = await render_json_patch(layout)
-        assert patch_3.path == ""
-        assert patch_3.changes == [
-            {"op": "replace", "path": "/children/0/children/0", "value": "2"}
-        ]
+        update_3 = await layout.render()
+        assert update_3 == LayoutUpdate(
+            path="",
+            old=update_2.new,
+            new={
+                "tagName": "",
+                "children": [{"tagName": "div", "children": ["2"]}],
+            },
+        )
 
 
 async def test_set_state_callback_identity_is_preserved():
@@ -240,7 +247,7 @@ async def test_simple_input_with_use_state(display: DisplayFixture):
     await display.show(Input)
 
     button = await display.page.wait_for_selector("#input")
-    await button.type("this is a test")
+    await button.type("this is a test", delay=DEFAULT_TYPE_DELAY)
     await display.page.wait_for_selector("#complete")
 
     assert message_ref.current == "this is a test"
@@ -935,11 +942,8 @@ async def test_use_context_default_value():
 
 
 def test_context_repr():
-    Context = idom.create_context(None)
-    assert re.match(r"Context\(.*\)", repr(Context()))
-
-    MyContext = idom.create_context(None, name="MyContext")
-    assert re.match(r"MyContext\(.*\)", repr(MyContext()))
+    sample_context = idom.create_context(None)
+    assert repr(sample_context()) == f"ContextProvider({sample_context})"
 
 
 async def test_use_context_only_renders_for_value_change():
@@ -1068,8 +1072,8 @@ async def test_nested_contexts_do_not_conflict():
 
 
 async def test_neighboring_contexts_do_not_conflict():
-    LeftContext = idom.create_context(None, name="Left")
-    RightContext = idom.create_context(None, name="Right")
+    LeftContext = idom.create_context(None)
+    RightContext = idom.create_context(None)
 
     set_left = idom.Ref()
     set_right = idom.Ref()
@@ -1247,3 +1251,147 @@ async def test_use_debug_mode_does_not_log_if_not_in_debug_mode():
 
         with assert_idom_did_not_log(r"SomeComponent\(.*?\) message is 'bye'"):
             await layout.render()
+
+
+async def test_conditionally_rendered_components_can_use_context():
+    set_state = idom.Ref()
+    used_context_values = []
+    some_context = idom.create_context(None)
+
+    @idom.component
+    def SomeComponent():
+        state, set_state.current = idom.use_state(True)
+        if state:
+            return FirstCondition()
+        else:
+            return SecondCondition()
+
+    @idom.component
+    def FirstCondition():
+        used_context_values.append(idom.use_context(some_context) + "-1")
+
+    @idom.component
+    def SecondCondition():
+        used_context_values.append(idom.use_context(some_context) + "-2")
+
+    async with idom.Layout(some_context(SomeComponent(), value="the-value")) as layout:
+        await layout.render()
+        assert used_context_values == ["the-value-1"]
+        set_state.current(False)
+        await layout.render()
+        assert used_context_values == ["the-value-1", "the-value-2"]
+
+
+@pytest.mark.parametrize(
+    "x, y, result",
+    [
+        ("text", "text", True),
+        ("text", "not-text", False),
+        (b"text", b"text", True),
+        (b"text", b"not-text", False),
+        (bytearray([1, 2, 3]), bytearray([1, 2, 3]), True),
+        (bytearray([1, 2, 3]), bytearray([1, 2, 3, 4]), False),
+        (1.0, 1.0, True),
+        (1.0, 2.0, False),
+        (1j, 1j, True),
+        (1j, 2j, False),
+        # ints less than 5 and greater than 256 are always identical
+        (-100000, -100000, True),
+        (100000, 100000, True),
+        (123, 456, False),
+    ],
+)
+def test_strictly_equal(x, y, result):
+    assert strictly_equal(x, y) is result
+
+
+STRICT_EQUALITY_VALUE_CONSTRUCTORS = [
+    lambda: "string-text",
+    lambda: b"byte-text",
+    lambda: bytearray([1, 2, 3]),
+    lambda: bytearray([1, 2, 3]),
+    lambda: 1.0,
+    lambda: 10000000,
+    lambda: 1j,
+]
+
+
+@pytest.mark.parametrize("get_value", STRICT_EQUALITY_VALUE_CONSTRUCTORS)
+async def test_use_state_compares_with_strict_equality(get_value):
+    render_count = idom.Ref(0)
+    set_state = idom.Ref()
+
+    @idom.component
+    def SomeComponent():
+        _, set_state.current = idom.use_state(get_value())
+        render_count.current += 1
+
+    async with idom.Layout(SomeComponent()) as layout:
+        await layout.render()
+        assert render_count.current == 1
+        set_state.current(get_value())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(layout.render(), timeout=0.1)
+
+
+@pytest.mark.parametrize("get_value", STRICT_EQUALITY_VALUE_CONSTRUCTORS)
+async def test_use_effect_compares_with_strict_equality(get_value):
+    effect_count = idom.Ref(0)
+    value = idom.Ref("string")
+    hook = HookCatcher()
+
+    @idom.component
+    @hook.capture
+    def SomeComponent():
+        @idom.use_effect(dependencies=[value.current])
+        def incr_effect_count():
+            effect_count.current += 1
+
+    async with idom.Layout(SomeComponent()) as layout:
+        await layout.render()
+        assert effect_count.current == 1
+        value.current = "string"  # new string instance but same value
+        hook.latest.schedule_render()
+        await layout.render()
+        # effect does not trigger
+        assert effect_count.current == 1
+
+
+@pytest.mark.parametrize("get_value", STRICT_EQUALITY_VALUE_CONSTRUCTORS)
+async def test_use_context_compares_with_strict_equality(get_value):
+    hook = HookCatcher()
+    context = idom.create_context(None)
+    inner_render_count = idom.Ref(0)
+
+    @idom.component
+    @hook.capture
+    def OuterComponent():
+        return context(InnerComponent(), value=get_value())
+
+    @idom.component
+    def InnerComponent():
+        idom.use_context(context)
+        inner_render_count.current += 1
+
+    async with idom.Layout(OuterComponent()) as layout:
+        await layout.render()
+        assert inner_render_count.current == 1
+        hook.latest.schedule_render()
+        await layout.render()
+        assert inner_render_count.current == 1
+
+
+async def test_use_state_named_tuple():
+    state = idom.Ref()
+
+    @idom.component
+    def some_component():
+        state.current = idom.use_state(1)
+        return None
+
+    async with idom.Layout(some_component()) as layout:
+        await layout.render()
+        assert state.current.value == 1
+        state.current.set_value(2)
+        await layout.render()
+        assert state.current.value == 2

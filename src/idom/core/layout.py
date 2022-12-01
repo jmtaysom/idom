@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 from collections import Counter
-from functools import wraps
+from contextlib import ExitStack
 from logging import getLogger
 from typing import (
     Any,
@@ -23,11 +23,7 @@ from typing import (
 from uuid import uuid4
 from weakref import ref as weakref
 
-from idom.config import (
-    IDOM_CHECK_VDOM_SPEC,
-    IDOM_DEBUG_MODE,
-    IDOM_FEATURE_INDEX_AS_DEFAULT_KEY,
-)
+from idom.config import IDOM_CHECK_VDOM_SPEC, IDOM_DEBUG_MODE
 from idom.utils import Ref
 
 from ._event_proxy import _wrap_in_warning_event_proxies
@@ -135,37 +131,22 @@ class Layout:
             except KeyError:
                 logger.debug(
                     "Did not render component with model state ID "
-                    "{model_state_id!r} - component already unmounted"
+                    f"{model_state_id!r} - component already unmounted"
                 )
             else:
-                return self._create_layout_update(model_state)
-
-    if IDOM_CHECK_VDOM_SPEC.current:
-        # If in debug mode inject a function that ensures all returned updates
-        # contain valid VDOM models. We only do this in debug mode or when this check
-        # is explicitely turned in order to avoid unnecessarily impacting performance.
-
-        _debug_render = render
-
-        @wraps(_debug_render)
-        async def render(self) -> LayoutUpdate:
-            result = await self._debug_render()
-            # Ensure that the model is valid VDOM on each render
-            root_id = self._root_life_cycle_state_id
-            root_model = self._model_states_by_life_cycle_state_id[root_id]
-            validate_vdom_json(root_model.model.current)
-            return result
+                update = self._create_layout_update(model_state)
+                if IDOM_CHECK_VDOM_SPEC.current:
+                    root_id = self._root_life_cycle_state_id
+                    root_model = self._model_states_by_life_cycle_state_id[root_id]
+                    validate_vdom_json(root_model.model.current)
+                return update
 
     def _create_layout_update(self, old_state: _ModelState) -> LayoutUpdate:
         new_state = _copy_component_model_state(old_state)
-
         component = new_state.life_cycle_state.component
-        self._render_component(old_state, new_state, component)
 
-        # hook effects must run after the update is complete
-        for model_state in _iter_model_state_children(new_state):
-            if model_state.is_component_state:
-                model_state.life_cycle_state.hook.affect_layout_did_render()
+        with ExitStack() as exit_stack:
+            self._render_component(exit_stack, old_state, new_state, component)
 
         old_model: Optional[VdomJson]
         try:
@@ -181,6 +162,7 @@ class Layout:
 
     def _render_component(
         self,
+        exit_stack: ExitStack,
         old_state: Optional[_ModelState],
         new_state: _ModelState,
         component: ComponentType,
@@ -200,19 +182,17 @@ class Layout:
         else:
             life_cycle_hook = life_cycle_state.hook
             life_cycle_hook.affect_component_will_render(component)
+            exit_stack.callback(life_cycle_hook.affect_layout_did_render)
+            life_cycle_hook.set_current()
             try:
-                life_cycle_hook.set_current()
-                try:
-                    raw_model = component.render()
-                finally:
-                    life_cycle_hook.unset_current()
+                raw_model = component.render()
                 # wrap the model in a fragment (i.e. tagName="") to ensure components have
                 # a separate node in the model state tree. This could be removed if this
                 # components are given a node in the tree some other way
                 wrapper_model: VdomDict = {"tagName": ""}
                 if raw_model is not None:
                     wrapper_model["children"] = [raw_model]
-                self._render_model(old_state, new_state, wrapper_model)
+                self._render_model(exit_stack, old_state, new_state, wrapper_model)
             except Exception as error:
                 logger.exception(f"Failed to render {component}")
                 new_state.model.current = {
@@ -224,6 +204,7 @@ class Layout:
                     ),
                 }
             finally:
+                life_cycle_hook.unset_current()
                 life_cycle_hook.affect_component_did_render()
 
         try:
@@ -233,16 +214,24 @@ class Layout:
         else:
             key, index = new_state.key, new_state.index
             parent.children_by_key[key] = new_state
-            # need to do insertion in case where old_state is None and we're appending
-            parent.model.current["children"][index : index + 1] = [
-                new_state.model.current
-            ]
+            # need to add this model to parent's children without mutating parent model
+            old_parent_model = parent.model.current
+            old_parent_children = old_parent_model["children"]
+            parent.model.current = {
+                **old_parent_model,  # type: ignore[misc]
+                "children": [
+                    *old_parent_children[:index],
+                    new_state.model.current,
+                    *old_parent_children[index + 1 :],
+                ],
+            }
         finally:
             # avoid double render
             self._rendering_queue.remove_if_pending(life_cycle_state.id)
 
     def _render_model(
         self,
+        exit_stack: ExitStack,
         old_state: Optional[_ModelState],
         new_state: _ModelState,
         raw_model: Any,
@@ -253,7 +242,9 @@ class Layout:
         if "importSource" in raw_model:
             new_state.model.current["importSource"] = raw_model["importSource"]
         self._render_model_attributes(old_state, new_state, raw_model)
-        self._render_model_children(old_state, new_state, raw_model.get("children", []))
+        self._render_model_children(
+            exit_stack, old_state, new_state, raw_model.get("children", [])
+        )
 
     def _render_model_attributes(
         self,
@@ -320,6 +311,7 @@ class Layout:
 
     def _render_model_children(
         self,
+        exit_stack: ExitStack,
         old_state: Optional[_ModelState],
         new_state: _ModelState,
         raw_children: Any,
@@ -329,7 +321,9 @@ class Layout:
 
         if old_state is None:
             if raw_children:
-                self._render_model_children_without_old_state(new_state, raw_children)
+                self._render_model_children_without_old_state(
+                    exit_stack, new_state, raw_children
+                )
             return None
         elif not raw_children:
             self._unmount_model_states(list(old_state.children_by_key.values()))
@@ -351,7 +345,7 @@ class Layout:
                 [old_state.children_by_key[key] for key in old_keys]
             )
 
-        new_children = new_state.model.current["children"] = []
+        new_state.model.current["children"] = []
         for index, (child, child_type, key) in enumerate(child_type_key_tuples):
             old_child_state = old_state.children_by_key.get(key)
             if child_type is _DICT_TYPE:
@@ -377,8 +371,8 @@ class Layout:
                             new_state,
                             index,
                         )
-                self._render_model(old_child_state, new_child_state, child)
-                new_children.append(new_child_state.model.current)
+                self._render_model(exit_stack, old_child_state, new_child_state, child)
+                new_state.append_child(new_child_state.model.current)
                 new_state.children_by_key[key] = new_child_state
             elif child_type is _COMPONENT_TYPE:
                 child = cast(ComponentType, child)
@@ -411,15 +405,20 @@ class Layout:
                         child,
                         self._rendering_queue.put,
                     )
-                self._render_component(old_child_state, new_child_state, child)
+                self._render_component(
+                    exit_stack, old_child_state, new_child_state, child
+                )
             else:
                 old_child_state = old_state.children_by_key.get(key)
                 if old_child_state is not None:
                     self._unmount_model_states([old_child_state])
-                new_children.append(child)
+                new_state.append_child(child)
 
     def _render_model_children_without_old_state(
-        self, new_state: _ModelState, raw_children: List[Any]
+        self,
+        exit_stack: ExitStack,
+        new_state: _ModelState,
+        raw_children: List[Any],
     ) -> None:
         child_type_key_tuples = list(_process_child_type_and_key(raw_children))
 
@@ -431,20 +430,20 @@ class Layout:
                 f"Duplicate keys {duplicate_keys} at {new_state.patch_path or '/'!r}"
             )
 
-        new_children = new_state.model.current["children"] = []
+        new_state.model.current["children"] = []
         for index, (child, child_type, key) in enumerate(child_type_key_tuples):
             if child_type is _DICT_TYPE:
                 child_state = _make_element_model_state(new_state, index, key)
-                self._render_model(None, child_state, child)
-                new_children.append(child_state.model.current)
+                self._render_model(exit_stack, None, child_state, child)
+                new_state.append_child(child_state.model.current)
                 new_state.children_by_key[key] = child_state
             elif child_type is _COMPONENT_TYPE:
                 child_state = _make_component_model_state(
                     new_state, index, key, child, self._rendering_queue.put
                 )
-                self._render_component(None, child_state, child)
+                self._render_component(exit_stack, None, child_state, child)
             else:
-                new_children.append(child)
+                new_state.append_child(child)
 
     def _unmount_model_states(self, old_states: List[_ModelState]) -> None:
         to_unmount = old_states[::-1]  # unmount in reversed order of rendering
@@ -471,12 +470,6 @@ def _check_should_render(old: ComponentType, new: ComponentType) -> bool:
     except Exception:
         logger.exception(f"{old} component failed to check if {new} should be rendered")
         return False
-
-
-def _iter_model_state_children(model_state: _ModelState) -> Iterator[_ModelState]:
-    yield model_state
-    for child in model_state.children_by_key.values():
-        yield from _iter_model_state_children(child)
 
 
 def _new_root_model_state(
@@ -652,6 +645,9 @@ class _ModelState:
         assert parent is not None, "detached model state"
         return parent
 
+    def append_child(self, child: Any) -> None:
+        self.model.current["children"].append(child)
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"ModelState({ {s: getattr(self, s, None) for s in self.__slots__} })"
 
@@ -704,7 +700,7 @@ class _ThreadSafeQueue(Generic[_Type]):
     __slots__ = "_loop", "_queue", "_pending"
 
     def __init__(self) -> None:
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue[_Type] = asyncio.Queue()
         self._pending: Set[_Type] = set()
 
@@ -743,7 +739,7 @@ def _process_child_type_and_key(
             key = None
 
         if key is None:
-            key = _default_key(index)
+            key = index
 
         yield (child, child_type, key)
 
@@ -753,14 +749,3 @@ _ElementType = NewType("_ElementType", int)
 _DICT_TYPE = _ElementType(1)
 _COMPONENT_TYPE = _ElementType(2)
 _STRING_TYPE = _ElementType(3)
-
-
-if IDOM_FEATURE_INDEX_AS_DEFAULT_KEY.current:
-
-    def _default_key(index: int) -> Any:
-        return index
-
-else:
-
-    def _default_key(index: int) -> Any:  # pragma: no cover
-        return object()

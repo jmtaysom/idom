@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import sys
+from collections import namedtuple
 from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Generic,
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Type,
@@ -16,6 +21,19 @@ from typing import (
 )
 
 from typing_extensions import Protocol, TypedDict, runtime_checkable
+
+
+_Type = TypeVar("_Type")
+
+
+if TYPE_CHECKING or sys.version_info < (3, 9) or sys.version_info >= (3, 11):
+
+    class State(NamedTuple, Generic[_Type]):
+        value: _Type
+        set_value: Callable[[_Type | Callable[[_Type], _Type]], None]
+
+else:  # pragma: no cover
+    State = namedtuple("State", ("value", "set_value"))
 
 
 ComponentConstructor = Callable[..., "ComponentType"]
@@ -44,7 +62,7 @@ class ComponentType(Protocol):
     This is used to see if two component instances share the same definition.
     """
 
-    def render(self) -> VdomDict | ComponentType | None:
+    def render(self) -> VdomDict | ComponentType | str | None:
         """Render the component's view model."""
 
     def should_render(self: _OwnType, new: _OwnType) -> bool:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
@@ -14,6 +13,7 @@ from idom.core.events import (
     to_event_handler_function,
 )
 from idom.core.types import (
+    ComponentType,
     EventHandlerDict,
     EventHandlerMapping,
     EventHandlerType,
@@ -22,6 +22,8 @@ from idom.core.types import (
     VdomDict,
     VdomJson,
 )
+
+from ._f_back import f_module_name
 
 
 logger = logging.getLogger()
@@ -223,13 +225,10 @@ def make_vdom_constructor(
         "element represented by a :class:`VdomDict`."
     )
 
-    frame = inspect.currentframe()
-    if frame is not None and frame.f_back is not None and frame.f_back is not None:
-        module = frame.f_back.f_globals.get("__name__")  # module in outer frame
-        if module is not None:
-            qualname = module + "." + tag
-            constructor.__module__ = module
-            constructor.__qualname__ = qualname
+    module_name = f_module_name(1)
+    if module_name:
+        constructor.__module__ = module_name
+        constructor.__qualname__ = f"{module_name}.{tag}"
 
     return constructor
 
@@ -297,47 +296,30 @@ def _is_attributes(value: Any) -> bool:
     return isinstance(value, Mapping) and "tagName" not in value
 
 
-if IDOM_DEBUG_MODE.current:
-
-    _debug_is_attributes = _is_attributes
-
-    def _is_attributes(value: Any) -> bool:
-        result = _debug_is_attributes(value)
-        if result and "children" in value:
-            logger.error(f"Reserved key 'children' found in attributes {value}")
-        return result
-
-
 def _is_single_child(value: Any) -> bool:
-    return isinstance(value, (str, Mapping)) or not hasattr(value, "__iter__")
+    if isinstance(value, (str, Mapping)) or not hasattr(value, "__iter__"):
+        return True
+    if IDOM_DEBUG_MODE.current:
+        _validate_child_key_integrity(value)
+    return False
 
 
-if IDOM_DEBUG_MODE.current:
+def _validate_child_key_integrity(value: Any) -> None:
+    if hasattr(value, "__iter__") and not hasattr(value, "__len__"):
+        logger.error(
+            f"Did not verify key-path integrity of children in generator {value} "
+            "- pass a sequence (i.e. list of finite length) in order to verify"
+        )
+    else:
+        for child in value:
+            if isinstance(child, ComponentType) and child.key is None:
+                logger.error(f"Key not specified for child in list {child}")
+            elif isinstance(child, Mapping) and "key" not in child:
+                # remove 'children' to reduce log spam
+                child_copy = {**child, "children": _EllipsisRepr()}
+                logger.error(f"Key not specified for child in list {child_copy}")
 
-    _debug_is_single_child = _is_single_child
 
-    def _is_single_child(value: Any) -> bool:
-        if _debug_is_single_child(value):
-            return True
-
-        from .types import ComponentType
-
-        if hasattr(value, "__iter__") and not hasattr(value, "__len__"):
-            logger.error(
-                f"Did not verify key-path integrity of children in generator {value} "
-                "- pass a sequence (i.e. list of finite length) in order to verify"
-            )
-        else:
-            for child in value:
-                if isinstance(child, ComponentType) and child.key is None:
-                    logger.error(f"Key not specified for child in list {child}")
-                elif isinstance(child, Mapping) and "key" not in child:
-                    # remove 'children' to reduce log spam
-                    child_copy = {**child, "children": _EllipsisRepr()}
-                    logger.error(f"Key not specified for child in list {child_copy}")
-
-        return False
-
-    class _EllipsisRepr:
-        def __repr__(self) -> str:
-            return "..."
+class _EllipsisRepr:
+    def __repr__(self) -> str:
+        return "..."

@@ -1,7 +1,10 @@
+from html import escape as html_escape
+
 import pytest
 
 import idom
-from idom.utils import html_to_vdom
+from idom import html
+from idom.utils import HTMLParseError, html_to_vdom, vdom_to_html
 
 
 def test_basic_ref_behavior():
@@ -60,18 +63,15 @@ def test_ref_repr():
     ],
 )
 def test_html_to_vdom(case):
-    assert html_to_vdom(case["source"]) == {
-        "tagName": "div",
-        "children": [case["model"]],
-    }
+    assert html_to_vdom(case["source"]) == case["model"]
 
 
 def test_html_to_vdom_transform():
-    source = "<p>hello <a>world</a> and <a>universe</a></p>"
+    source = "<p>hello <a>world</a> and <a>universe</a>lmao</p>"
 
     def make_links_blue(node):
         if node["tagName"] == "a":
-            node["attributes"]["style"] = {"color": "blue"}
+            node["attributes"] = {"style": {"color": "blue"}}
         return node
 
     expected = {
@@ -89,10 +89,144 @@ def test_html_to_vdom_transform():
                 "children": ["universe"],
                 "attributes": {"style": {"color": "blue"}},
             },
+            "lmao",
         ],
     }
 
-    assert html_to_vdom(source, make_links_blue) == {
-        "tagName": "div",
-        "children": [expected],
+    assert html_to_vdom(source, make_links_blue) == expected
+
+
+def test_non_html_tag_behavior():
+    source = "<my-tag data-x=something><my-other-tag key=a-key /></my-tag>"
+
+    expected = {
+        "tagName": "my-tag",
+        "attributes": {"data-x": "something"},
+        "children": [
+            {"tagName": "my-other-tag", "key": "a-key"},
+        ],
     }
+
+    assert html_to_vdom(source, strict=False) == expected
+
+    with pytest.raises(HTMLParseError):
+        html_to_vdom(source, strict=True)
+
+
+def test_html_to_vdom_with_null_tag():
+    source = "<p>hello<br>world</p>"
+
+    expected = {
+        "tagName": "p",
+        "children": [
+            "hello",
+            {"tagName": "br"},
+            "world",
+        ],
+    }
+
+    assert html_to_vdom(source) == expected
+
+
+def test_html_to_vdom_with_style_attr():
+    source = '<p style="color: red; background-color : green; ">Hello World.</p>'
+
+    expected = {
+        "attributes": {"style": {"backgroundColor": "green", "color": "red"}},
+        "children": ["Hello World."],
+        "tagName": "p",
+    }
+
+    assert html_to_vdom(source) == expected
+
+
+def test_html_to_vdom_with_no_parent_node():
+    source = "<p>Hello</p><div>World</div>"
+
+    expected = {
+        "tagName": "",
+        "children": [
+            {"tagName": "p", "children": ["Hello"]},
+            {"tagName": "div", "children": ["World"]},
+        ],
+    }
+
+    assert html_to_vdom(source) == expected
+
+
+SOME_OBJECT = object()
+
+
+@pytest.mark.parametrize(
+    "vdom_in, html_out",
+    [
+        (
+            html.div("hello"),
+            "<div>hello</div>",
+        ),
+        (
+            html.div(SOME_OBJECT),
+            f"<div>{html_escape(str(SOME_OBJECT))}</div>",
+        ),
+        (
+            html.div({"someAttribute": SOME_OBJECT}),
+            f'<div someattribute="{html_escape(str(SOME_OBJECT))}"></div>',
+        ),
+        (
+            html.div(
+                "hello", html.a({"href": "https://example.com"}, "example"), "world"
+            ),
+            '<div>hello<a href="https://example.com">example</a>world</div>',
+        ),
+        (
+            html.button({"onClick": lambda event: None}),
+            "<button></button>",
+        ),
+        (
+            html._("hello ", html._("world")),
+            "hello world",
+        ),
+        (
+            html._(html.div("hello"), html._("world")),
+            "<div>hello</div>world",
+        ),
+        (
+            html.div({"style": {"backgroundColor": "blue", "marginLeft": "10px"}}),
+            '<div style="background-color:blue;margin-left:10px"></div>',
+        ),
+        (
+            html.div({"style": "background-color:blue;margin-left:10px"}),
+            '<div style="background-color:blue;margin-left:10px"></div>',
+        ),
+        (
+            html._(
+                html.div("hello"),
+                html.a({"href": "https://example.com"}, "example"),
+            ),
+            '<div>hello</div><a href="https://example.com">example</a>',
+        ),
+        (
+            html.div(
+                html._(
+                    html.div("hello"),
+                    html.a({"href": "https://example.com"}, "example"),
+                ),
+                html.button(),
+            ),
+            '<div><div>hello</div><a href="https://example.com">example</a><button></button></div>',
+        ),
+        (
+            html.div(
+                {"dataSomething": 1, "dataSomethingElse": 2, "dataisnotdashed": 3}
+            ),
+            '<div data-something="1" data-something-else="2" dataisnotdashed="3"></div>',
+        ),
+    ],
+)
+def test_vdom_to_html(vdom_in, html_out):
+    assert vdom_to_html(vdom_in) == html_out
+
+
+def test_vdom_to_html_error():
+    with pytest.raises(TypeError, match="Expected a VDOM dict"):
+        vdom_to_html({"notVdom": True})

@@ -13,7 +13,6 @@ from ._option import Option as _Option
 IDOM_DEBUG_MODE = _Option(
     "IDOM_DEBUG_MODE",
     default=False,
-    mutable=False,
     validator=lambda x: bool(int(x)),
 )
 """This immutable option turns on/off debug mode
@@ -27,8 +26,7 @@ log level for IDOM is set to ``DEBUG``.
 
 IDOM_CHECK_VDOM_SPEC = _Option(
     "IDOM_CHECK_VDOM_SPEC",
-    default=IDOM_DEBUG_MODE.current,
-    mutable=False,
+    default=IDOM_DEBUG_MODE,
     validator=lambda x: bool(int(x)),
 )
 """This immutable option turns on/off checks which ensure VDOM is rendered to spec
@@ -62,25 +60,10 @@ IDOM_WED_MODULES_DIR: _Option[Path] = _DeprecatedOption(
 )
 """This has been renamed to :data:`IDOM_WEB_MODULES_DIR`"""
 
-IDOM_FEATURE_INDEX_AS_DEFAULT_KEY = _Option(
-    "IDOM_FEATURE_INDEX_AS_DEFAULT_KEY",
-    default=True,
-    mutable=False,
-    validator=lambda x: bool(int(x)),
-)
-"""Use the index of elements/components amongst their siblings as the default key.
-
-The flag's default value is set to true. To return to legacy behavior set
-``IDOM_FEATURE_INDEX_AS_DEFAULT_KEY=0``. In a future release, this flag will be removed
-entirely and the indices will always be the default key.
-
-For more information on changes to this feature flag see:
-https://github.com/idom-team/idom/issues/351
-"""
-
 IDOM_TESTING_DEFAULT_TIMEOUT = _Option(
     "IDOM_TESTING_DEFAULT_TIMEOUT",
-    3.0,
+    5.0,
     mutable=False,
     validator=float,
 )
+"""A default timeout for testing utilities in IDOM"""

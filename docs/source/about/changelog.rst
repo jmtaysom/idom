@@ -23,7 +23,139 @@ more info, see the :ref:`Contributor Guide <Creating a Changelog Entry>`.
 Unreleased
 ----------
 
-No changes.
+**Removed**
+
+- :pull:`840` - Remove ``IDOM_FEATURE_INDEX_AS_DEFAULT_KEY`` option
+- :pull:`835` - ``serve_static_files`` option from backend configuration
+
+**Added**
+
+- :pull:`835` - Ability to customize the ``<head>`` element of IDOM's built-in client.
+- :pull:`835` - ``vdom_to_html`` utility function.
+- :pull:`843` - Ability to subscribe to changes that are made to mutable options.
+- :pull:`699` - Support for form element serialization
+
+**Fixed**
+
+- :issue:`582` - ``IDOM_DEBUG_MODE`` is now mutable and can be changed at runtime
+
+
+v0.41.0
+-------
+:octicon:`milestone` *released on 2022-11-01*
+
+**Changed**
+
+- :pull:`823` - The hooks ``use_location`` and ``use_scope`` are no longer
+  implementation specific and are now available as top-level imports. Instead of each
+  backend defining these hooks, backends establish a ``ConnectionContext`` with this
+  information.
+- :pull:`824` - IDOM's built-in backend server now expose the following routes:
+
+  - ``/_idom/assets/<file-path>``
+  - ``/_idom/stream/<path>``
+  - ``/_idom/modules/<file-path>``
+  - ``/<prefix>/<path>``
+
+  This should allow the browser to cache static resources. Even if your ``url_prefix``
+  is ``/_idom``, your app should still work as expected. Though if you're using
+  ``idom-router``, IDOM's server routes will always take priority.
+- :pull:`824` - Backend implementations now strip any URL prefix in the pathname for
+  ``use_location``.
+- :pull:`827` - ``use_state`` now returns a named tuple with ``value`` and ``set_value``
+  fields. This is convenient for adding type annotations if the initial state value is
+  not the same as the values you might pass to the state setter. Where previously you
+  might have to do something like:
+
+  .. code-block::
+
+      value: int | None = None
+      value, set_value = use_state(value)
+
+  Now you can annotate your state using the ``State`` class:
+
+  .. code-block::
+
+      state: State[int | None] = use_state(None)
+
+      # access value and setter
+      state.value
+      state.set_value
+
+      # can still destructure if you need to
+      value, set_value = state
+
+**Added**
+
+- :pull:`823` - There is a new ``use_connection`` hook which returns a ``Connection``
+  object. This ``Connection`` object contains a ``location`` and ``scope``, along with
+  a ``carrier`` which is unique to each backend implementation.
+
+
+v0.40.2
+-------
+:octicon:`milestone` *released on 2022-09-13*
+
+**Changed**
+
+- :pull:`809` - Avoid the use of JSON patch for diffing models.
+
+
+v0.40.1
+-------
+:octicon:`milestone` *released on 2022-09-11*
+
+**Fixed**
+
+- :issue:`806` - Child models after a component fail to render
+
+
+v0.40.0 (yanked)
+----------------
+:octicon:`milestone` *released on 2022-08-13*
+
+**Fixed**
+
+- :issue:`777` - Fix edge cases where ``html_to_vdom`` can fail to convert HTML
+- :issue:`789` - Conditionally rendered components cannot use contexts
+- :issue:`773` - Use strict equality check for text, numeric, and binary types in hooks
+- :issue:`801` - Accidental mutation of old model causes invalid JSON Patch
+
+**Changed**
+
+- :pull:`123` - set default timeout on playwright page for testing
+- :pull:`787` - Track contexts in hooks as state
+- :pull:`787` - remove non-standard ``name`` argument from ``create_context``
+
+**Added**
+
+- :pull:`123` - ``asgiref`` as a dependency
+- :pull:`795` - ``lxml`` as a dependency
+
+
+v0.39.0
+-------
+:octicon:`milestone` *released on 2022-06-20*
+
+**Fixed**
+
+- :pull:`763` - ``No module named 'idom.server'`` from ``idom.run``
+- :pull:`749` - Setting appropriate MIME type for web modules in `sanic` server implementation
+
+**Changed**
+
+- :pull:`763` - renamed various:
+
+  - ``idom.testing.server -> idom.testing.backend``
+  - ``ServerFixture -> BackendFixture``
+  - ``DisplayFixture.server -> DisplayFixture.backend``
+
+- :pull:`765` - ``exports_default`` parameter is removed from ``module_from_template``.
+
+**Added**
+
+- :pull:`765` - ability to specify versions with module templates (e.g.
+  ``module_from_template("react@^17.0.0", ...)``).
 
 
 v0.38.1
